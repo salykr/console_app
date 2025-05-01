@@ -7,9 +7,9 @@ import time
 SECRET_FILE = 'secret.json'
 LOCK_FILE = 'lock.json'
 MAX_ATTEMPTS = 5
-LOCK_DURATION = 60
+LOCK_DURATION = 120  # 2 minutes in seconds
 EMAIL = "saly@example.com"
-PASSWORD = "saly"  
+PASSWORD = "saly"
 
 def save_secret(secret):
     with open(SECRET_FILE, 'w') as f:
@@ -29,21 +29,40 @@ def delete_secret():
 def load_lock_info():
     try:
         with open(LOCK_FILE, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {'attempts': 0, 'lock_until': 0}
+            lock_data = json.load(f)
+            # Auto-delete expired lock
+            if time.time() > lock_data.get('lock_until', 0):
+                reset_lock_info()
+                return {'attempts': 0, 'lock_until': 0, 'email': ''}
+            return lock_data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {'attempts': 0, 'lock_until': 0, 'email': ''}
 
-def save_lock_info(attempts, lock_until):
+def save_lock_info(attempts, lock_until, email):
     with open(LOCK_FILE, 'w') as f:
-        json.dump({'attempts': attempts, 'lock_until': lock_until}, f)
+        json.dump({
+            'attempts': attempts,
+            'lock_until': lock_until,
+            'email': email
+        }, f)
 
 def reset_lock_info():
     if os.path.exists(LOCK_FILE):
         os.remove(LOCK_FILE)
 
+def check_user_lock(email):
+    lock_info = load_lock_info()
+    now = time.time()
+    
+    if lock_info['email'] == email and now < lock_info['lock_until']:
+        remaining = int(lock_info['lock_until'] - now)
+        print(f"\n======Too many failed attempts for {email}. Try again in {remaining} seconds.======")
+        return True
+    return False
+
 def setup_2fa():
     if load_secret():
-        print("2FA is already set up. No need to scan a new QR code.")
+        print("\n======2FA is already set up. No need to scan a new QR code.======")
         return True
 
     secret = pyotp.random_base32()
@@ -67,16 +86,11 @@ def setup_2fa():
         print("Code verified — 2FA setup complete.")
         return True
     else:
-        print("Invalid code. Setup failed.")
+        print("\n======Invalid code. Setup failed.======")
         return False
 
-def login_with_authenticator():
-    lock_info = load_lock_info()
-    now = time.time()
-
-    if now < lock_info['lock_until']:
-        remaining = int(lock_info['lock_until'] - now)
-        print(f"\n======Too many failed attempts. Please try again in {remaining} seconds.======")
+def login_with_authenticator(email):
+    if check_user_lock(email):
         return False
 
     secret = load_secret()
@@ -86,7 +100,9 @@ def login_with_authenticator():
             return False
         secret = load_secret()
 
+    lock_info = load_lock_info()
     attempts = 0
+    
     while attempts < MAX_ATTEMPTS:
         code = input("Enter the 6-digit code from Microsoft Authenticator: ")
         if pyotp.TOTP(secret).verify(code):
@@ -95,22 +111,43 @@ def login_with_authenticator():
             return True
         else:
             attempts += 1
-            print(f"\n======Invalid code. Attempt {attempts} of {MAX_ATTEMPTS}.======")
+            remaining_attempts = MAX_ATTEMPTS - attempts
+            print(f"\n======Invalid code. {remaining_attempts} attempts remaining.======")
 
-    lock_until = time.time() + LOCK_DURATION
-    save_lock_info(attempts, lock_until)
-    print(f"\n======Too many failed attempts. You are locked out for {LOCK_DURATION} seconds.======")
+    save_lock_info(attempts, time.time() + LOCK_DURATION, email)
+    print(f"\n======Too many failed attempts for {email}. Locked for {LOCK_DURATION} seconds.======")
     return False
 
 def login_with_email_password():
     email = input("Enter email: ")
-    password = input("Enter password: ")
+    if email != EMAIL:
+        print("\n======Email not recognized.======")
+        return False
 
-    if email == EMAIL and password == PASSWORD:
-        print("Login successful with email and password.")
-        return True
+    if check_user_lock(email):
+        return False
+
+    lock_info = load_lock_info()
+    attempts = 0
+    
+    while attempts < 3:
+        password = input("Enter password: ")
+        if password == PASSWORD:
+            print("Login successful with email and password.")
+            reset_lock_info()
+            return True
+        else:
+            attempts += 1
+            remaining_attempts = 3 - attempts
+            print(f"Invalid password. {remaining_attempts} attempts remaining.")
+
+    print("\n======Too many failed password attempts.======")
+    if load_secret():
+        print("Please enter the 6-digit code from Microsoft Authenticator.")
+        return login_with_authenticator(email)
     else:
-        print("Invalid email or password.")
+        save_lock_info(attempts, time.time() + LOCK_DURATION, email)
+        print("2FA is not set up for this account. Access denied.")
         return False
 
 def main():
@@ -129,12 +166,8 @@ def main():
                 is_logged_in = login_with_email_password()
             elif choice == "2":
                 email = input("Enter email: ")
-                secret = load_secret()
                 if email == EMAIL:
-                    if secret:
-                        is_logged_in = login_with_authenticator()
-                    else:
-                        print("\n======2FA is not set up for this account.======")
+                    is_logged_in = login_with_authenticator(email)
                 else:
                     print("\n======Email not recognized.======")
             elif choice == "3":
@@ -144,9 +177,7 @@ def main():
                 print("\n======Invalid selection.======")
         else:
             print("\n======You are logged in.======")
-            secret = load_secret()
-            if not secret:
-                # print("\n======Note: 2FA is not enabled.======")
+            if not load_secret():
                 print("1. Set up 2FA")
                 print("2. Logout")
             else:
@@ -154,9 +185,9 @@ def main():
 
             choice = input("Enter your choice: ")
 
-            if choice == "1" and not secret:
+            if choice == "1" and not load_secret():
                 setup_2fa()
-            elif (choice == "1" and secret) or (choice == "2" and not secret):
+            elif choice in ("1", "2"):
                 is_logged_in = False
                 print("\n======You have been logged out.======")
             else:
